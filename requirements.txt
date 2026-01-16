@@ -1,0 +1,9 @@
+aiogram
+openai
+python-dotenv
+
+# Для бота с долгой памятью (bot_long_memory.py)
+chromadb
+PyPDF2
+python-docx
+
