@@ -7,15 +7,22 @@ Telegram-бот с гибридной памятью (короткая + дол�
 """
 
 import os
+import json
 import logging
 import tempfile
-from typing import Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Any
 from pathlib import Path
 from collections import deque
 
+from pydantic import BaseModel
+import openai
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, Document
+from aiogram.types import (
+    Message, Document, BotCommand, ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery,
+)
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
@@ -25,6 +32,9 @@ from chromadb.config import Settings
 # Библиотеки для работы с документами
 import PyPDF2
 from docx import Document as DocxDocument
+
+# База данных тезисов (SQLite)
+import database
 
 
 # Загрузка переменных окружения
@@ -84,6 +94,52 @@ def get_user_history(user_id: int) -> deque:
     if user_id not in user_histories:
         user_histories[user_id] = deque(maxlen=HISTORY_SIZE)
     return user_histories[user_id]
+
+
+# ============================================
+# РОЛИ ПОВЕДЕНИЯ (модель поведения)
+# ============================================
+
+DEFAULT_ROLE = "standard"
+ROLES: Dict[str, tuple] = {
+    "standard": (
+        "Стандартный помощник",
+        "Ты — универсальный помощник. Отвечай кратко и по делу, дружелюбно и понятно. "
+        "Опирайся на контекст диалога и документы пользователя."
+    ),
+    "scientific": (
+        "Научный",
+        "Ты работаешь в научном стиле: точные формулировки, уместные термины, опора на факты и логику. "
+        "При необходимости указывай допущения и ограничения. Стиль — академический, без лишней разговорности."
+    ),
+    "technical": (
+        "Технический",
+        "Ты — технический ассистент: чёткие пошаговые инструкции, код и команды при необходимости, "
+        "минимум воды. Форматируй списки и блоки кода явно. Стиль — документация и гайды."
+    ),
+    "creative": (
+        "Креативный",
+        "Ты отвечаешь развёрнуто и образно, предлагаешь идеи и варианты. "
+        "Можешь предлагать альтернативы и развивать мысль. Стиль — живой, без сухого перечисления."
+    ),
+    "concise": (
+        "Лаконичный",
+        "Ты отвечаешь максимально кратко: только суть, без вступлений и повторов. "
+        "Короткие фразы, тезисы, буллеты. Без лишних слов."
+    ),
+}
+user_roles: Dict[int, str] = {}
+
+
+def get_user_role(user_id: int) -> str:
+    """Вернуть ключ роли пользователя (по умолчанию standard)."""
+    return user_roles.get(user_id, DEFAULT_ROLE)
+
+
+def get_role_prompt(role_key: str) -> str:
+    """Текст для системного промпта по выбранной роли."""
+    name, instruction = ROLES.get(role_key, ROLES[DEFAULT_ROLE])
+    return f"\n\nРОЛЬ: {name}.\n{instruction}"
 
 
 # ============================================
@@ -195,6 +251,7 @@ async def embed_chunks(user_id: int, document_name: str, chunks: List[str]) -> i
         )
         
         logger.info(f"✅ Сохранено {len(chunks)} чанков в ChromaDB")
+        export_long_memory_to_json()
         return len(chunks)
     
     except Exception as e:
@@ -249,11 +306,48 @@ def delete_user_documents(user_id: int) -> int:
         if results and results['ids']:
             collection.delete(ids=results['ids'])
             logger.info(f"Удалено {len(results['ids'])} чанков для user_id={user_id}")
-            return len(results['ids'])
+            count = len(results['ids'])
+            export_long_memory_to_json()
+            return count
         return 0
     except Exception as e:
         logger.error(f"Ошибка удаления документов: {e}")
         return 0
+
+
+def export_long_memory_to_json() -> None:
+    """
+    Сохраняет в memory/memory.json только запросы пользователей —
+    текст сообщений, которые они вводят в строке ввода в Telegram.
+    """
+    try:
+        users: Dict[str, Dict[str, Any]] = {}
+        for user_id in database.get_all_user_ids_with_requests():
+            requests = database.get_all_user_requests(user_id)
+            users[str(user_id)] = {"requests": requests}
+
+        data = {
+            "updated": datetime.now(timezone.utc).isoformat(),
+            "users": users
+        }
+
+        memory_json_path = Path(MEMORY_PATH) / "memory.json"
+        memory_json_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(memory_json_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        logger.info("Запросы пользователей сохранены в %s", memory_json_path)
+    except Exception as e:
+        logger.error("Ошибка экспорта в memory.json: %s", e)
+
+
+# ============================================
+# СТРУКТУРИРОВАННЫЙ ОТВЕТ (тезисы + сообщение)
+# ============================================
+
+class DialogueResponse(BaseModel):
+    """Структура ответа: тезисы текущего диалога (вопрос + ответ) и сообщение для чата."""
+    theses: list[str]
+    message: str
 
 
 # ============================================
@@ -277,6 +371,16 @@ async def get_hybrid_response(user_id: int, user_message: str) -> str:
         messages = []
         
         # Системный промпт зависит от наличия документов
+        structured_instruction = (
+            "\n\nВАЖНО: Ты обязан ответить вызовом функции DialogueResponse с двумя полями:\n"
+            "1. theses — список кратких тезисов (1–10 пунктов), суммирующих текущий обмен: вопрос пользователя и твой ответ.\n"
+            "2. message — текст твоего ответа пользователю (то, что будет показано в чате).\n"
+            "Сначала сформулируй ответ в message, затем выдели тезисы диалога в theses."
+        )
+        # Тезисы из БД (история прошлых диалогов) — подставляем в системный промпт
+        db_theses_block = database.get_theses_for_prompt(user_id)
+        role_block = get_role_prompt(get_user_role(user_id))
+
         if has_documents:
             # Ищем релевантный контекст в документах
             context_chunks = await retrieve_context(user_id, user_message, top_k=3)
@@ -286,19 +390,32 @@ async def get_hybrid_response(user_id: int, user_message: str) -> str:
                 context = "\n\n---\n\n".join(context_chunks)
                 system_prompt = (
                     "Ты — AI-ассистент с доступом к документам пользователя и истории диалога.\n"
-                    "Правила:\n"
+                    + role_block
+                    + "\n\nПравила:\n"
                     "1. Используй информацию из документов, когда это релевантно\n"
                     "2. Используй историю диалога для контекста\n"
                     "3. Если информации нет в документах - отвечай на основе диалога\n"
                     "4. Будь полезным, точным и естественным\n\n"
                     f"ДОКУМЕНТЫ ПОЛЬЗОВАТЕЛЯ:\n{context}"
+                    + db_theses_block
+                    + structured_instruction
                 )
             else:
                 # Документы есть, но не релевантны к вопросу
-                system_prompt = "Ты — полезный AI-ассистент. Отвечай на основе истории диалога. У пользователя есть загруженные документы, но они не релевантны к текущему вопросу."
+                system_prompt = (
+                    "Ты — полезный AI-ассистент. У пользователя есть загруженные документы, но они не релевантны к текущему вопросу. Отвечай на основе истории диалога.\n"
+                    + role_block
+                    + db_theses_block
+                    + structured_instruction
+                )
         else:
             # Нет документов - обычный диалог
-            system_prompt = "Ты — полезный AI-ассистент. Отвечай кратко и по делу на основе истории диалога."
+            system_prompt = (
+                "Ты — полезный AI-ассистент. Отвечай на основе истории диалога.\n"
+                + role_block
+                + db_theses_block
+                + structured_instruction
+            )
         
         messages.append({"role": "system", "content": system_prompt})
         
@@ -308,10 +425,12 @@ async def get_hybrid_response(user_id: int, user_message: str) -> str:
         # Добавляем текущее сообщение
         messages.append({"role": "user", "content": user_message})
         
-        # Параметры запроса
+        # Параметры запроса для структурированного ответа (parse API)
         api_params = {
             "model": OPENAI_MODEL,
             "messages": messages,
+            "tools": [openai.pydantic_function_tool(DialogueResponse)],
+            "tool_choice": "required",
             "max_completion_tokens": OPENAI_MAX_COMPLETION_TOKENS
         }
         
@@ -322,10 +441,24 @@ async def get_hybrid_response(user_id: int, user_message: str) -> str:
         logger.info(f"Отправка запроса к API для user_id={user_id}")
         logger.debug(f"Количество сообщений: {len(messages)}, Документы: {has_documents}")
         
-        # Запрос к API
-        response = await openai_client.chat.completions.create(**api_params)
+        # Запрос к API (structured output: тезисы + сообщение)
+        response = await openai_client.beta.chat.completions.parse(**api_params)
         
-        ai_message = response.choices[0].message.content
+        tool_calls = response.choices[0].message.tool_calls
+        if not tool_calls:
+            logger.warning("Нет tool_calls в ответе, используем content как fallback")
+            ai_message = response.choices[0].message.content or "Не удалось сформировать ответ."
+            history.append({"role": "user", "content": user_message})
+            history.append({"role": "assistant", "content": ai_message})
+            return ai_message
+        
+        parsed: DialogueResponse = tool_calls[0].function.parsed_arguments
+        ai_message = parsed.message
+        theses = parsed.theses
+        
+        # Тезисы в консоль и в БД (таблица user_<user_id>)
+        logger.info("Тезисы диалога: %s", theses)
+        database.add_theses(user_id, theses)
         logger.info(f"Ответ получен, длина: {len(ai_message)} символов")
         
         # Сохраняем в короткую память
@@ -356,62 +489,132 @@ async def get_hybrid_response(user_id: int, user_message: str) -> str:
 # ОБРАБОТЧИКИ КОМАНД
 # ============================================
 
-@dp.message(Command("start"))
-async def cmd_start(message: Message):
-    """Обработчик команды /start"""
+# Список команд для меню бота (кнопка рядом со скрепкой)
+BOT_COMMANDS = [
+    BotCommand(command="start", description="Начать работу"),
+    BotCommand(command="role", description="Модель поведения"),
+    BotCommand(command="status", description="Статус памяти"),
+    BotCommand(command="clear_chat", description="Очистить историю диалога"),
+    BotCommand(command="clear_docs", description="Удалить документы"),
+    BotCommand(command="clear_all", description="Очистить всё"),
+    BotCommand(command="help", description="Подробная справка"),
+]
+
+# Тексты кнопок инлайн-меню (сетка над полем ввода)
+BTN_START = "🚀 Начать"
+BTN_ROLE = "🎭 Роль"
+BTN_STATUS = "📊 Статус"
+BTN_CLEAR_CHAT = "🧹 Очистить чат"
+BTN_CLEAR_DOCS = "📄 Удалить док."
+BTN_CLEAR_ALL = "🗑️ Очистить всё"
+BTN_HELP = "❓ Справка"
+
+# Клавиатура-меню (сетка кнопок над полем ввода, как во вложении)
+menu_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=BTN_START)],
+        [KeyboardButton(text=BTN_ROLE), KeyboardButton(text=BTN_STATUS)],
+        [KeyboardButton(text=BTN_CLEAR_CHAT), KeyboardButton(text=BTN_CLEAR_DOCS)],
+        [KeyboardButton(text=BTN_CLEAR_ALL)],
+        [KeyboardButton(text=BTN_HELP)],
+    ],
+    resize_keyboard=True,
+)
+
+
+async def _do_start(message: Message):
+    """Общая логика «Начать работу»."""
     user_id = message.from_user.id
-    
-    # Очищаем короткую память при старте
     if user_id in user_histories:
         user_histories[user_id].clear()
-    
     await message.answer(
         "👋 <b>Привет! Я бот с гибридной памятью.</b>\n\n"
-        "У меня есть два типа памяти:\n\n"
-        "💭 <b>Короткая память:</b> Я запоминаю последние 10 сообщений нашего диалога\n"
-        "📚 <b>Долгая память:</b> Я сохраняю ваши документы и могу отвечать по ним\n\n"
-        "📄 <b>Поддерживаемые форматы:</b> PDF, TXT, DOCX\n\n"
-        "⚙️ <b>Команды:</b>\n"
-        "/start - Начать заново\n"
-        "/status - Статус памяти\n"
-        "/clear_chat - Очистить историю диалога\n"
-        "/clear_docs - Очистить документы\n"
-        "/clear_all - Очистить всё\n"
-        "/help - Подробная справка",
-        parse_mode="HTML"
+        "💭 <b>Короткая память:</b> последние 10 сообщений диалога\n"
+        "📚 <b>Долгая память:</b> ваши документы (PDF, TXT, DOCX)\n\n"
+        "Давай начнём: можешь выбрать роль в меню ниже, загрузить документ или просто напиши мне.",
+        parse_mode="HTML",
+        reply_markup=menu_keyboard,
     )
 
 
+@dp.message(Command("start"))
+@dp.message(F.text == BTN_START)
+async def cmd_start(message: Message):
+    await _do_start(message)
+
+
+def _role_keyboard() -> InlineKeyboardMarkup:
+    """Инлайн-кнопки выбора роли (5 ролей)."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=ROLES["standard"][0], callback_data="role:standard")],
+        [InlineKeyboardButton(text=ROLES["scientific"][0], callback_data="role:scientific")],
+        [InlineKeyboardButton(text=ROLES["technical"][0], callback_data="role:technical")],
+        [InlineKeyboardButton(text=ROLES["creative"][0], callback_data="role:creative")],
+        [InlineKeyboardButton(text=ROLES["concise"][0], callback_data="role:concise")],
+    ])
+
+
+@dp.message(Command("role"))
+@dp.message(F.text == BTN_ROLE)
+async def cmd_role(message: Message):
+    """Модель поведения: текущая роль и выбор из 5 ролей."""
+    user_id = message.from_user.id
+    current = get_user_role(user_id)
+    name, _ = ROLES.get(current, ROLES[DEFAULT_ROLE])
+    await message.answer(
+        "🎭 <b>Модель поведения</b>\n\n"
+        f"Текущая роль: <b>{name}</b>\n\n"
+        "Выбери одну из ролей — от неё зависит стиль и тон ответов. "
+        "Память (диалог, документы, тезисы) работает во всех ролях.\n\n"
+        f"Модель: <code>{OPENAI_MODEL}</code>",
+        parse_mode="HTML",
+        reply_markup=_role_keyboard(),
+    )
+
+
+@dp.callback_query(F.data.startswith("role:"))
+async def cb_role(callback: CallbackQuery):
+    """Обработка нажатия кнопки выбора роли."""
+    role_key = callback.data.removeprefix("role:")
+    if role_key not in ROLES:
+        await callback.answer("Неизвестная роль")
+        return
+    user_id = callback.from_user.id
+    user_roles[user_id] = role_key
+    name = ROLES[role_key][0]
+    await callback.message.edit_text(
+        f"🎭 <b>Модель поведения</b>\n\n"
+        f"Роль установлена: <b>{name}</b>\n\n"
+        "Следующие ответы будут в выбранном стиле.\n\n"
+        f"Модель: <code>{OPENAI_MODEL}</code>",
+        parse_mode="HTML",
+    )
+    await callback.answer(f"Роль: {name}")
+
+
 @dp.message(Command("help"))
+@dp.message(F.text == BTN_HELP)
 async def cmd_help(message: Message):
-    """Обработчик команды /help"""
+    """Подробная справка"""
     await message.answer(
         "📚 <b>Подробная справка</b>\n\n"
         "<b>🎯 Как использовать:</b>\n\n"
-        "1️⃣ <b>Обычный диалог</b>\n"
-        "Просто пишите мне — я буду помнить последние 10 сообщений\n\n"
-        "2️⃣ <b>Работа с документами</b>\n"
-        "Отправьте документ (PDF/TXT/DOCX) — я сохраню его в базу знаний\n"
-        "Затем задавайте вопросы — я найду информацию в документе\n\n"
-        "3️⃣ <b>Гибридный режим</b>\n"
-        "Если у вас загружены документы, я автоматически использую:\n"
-        "• Информацию из документов (когда релевантно)\n"
-        "• Историю диалога (для контекста)\n\n"
-        "<b>💡 Преимущества:</b>\n"
-        "✅ Естественный диалог с памятью\n"
-        "✅ Точные ответы из документов\n"
-        "✅ Автоматический выбор источника информации\n"
-        "✅ Данные сохраняются между сеансами\n\n"
+        "1️⃣ <b>Диалог</b> — пишите, я помню последние 10 сообщений\n\n"
+        "2️⃣ <b>Документы</b> — отправьте PDF/TXT/DOCX, потом задавайте вопросы по ним\n\n"
+        "3️⃣ <b>Гибрид</b> — документы + история диалога подставляются автоматически\n\n"
         "<b>📋 Команды:</b>\n"
-        "/status - Посмотреть статистику\n"
-        "/clear_chat - Очистить историю диалога\n"
-        "/clear_docs - Удалить все документы\n"
-        "/clear_all - Сбросить всё",
+        "/start — Начать работу\n"
+        "/role — Модель поведения\n"
+        "/status — Статус памяти\n"
+        "/clear_chat — Очистить историю диалога\n"
+        "/clear_docs — Удалить документы\n"
+        "/clear_all — Очистить всё",
         parse_mode="HTML"
     )
 
 
 @dp.message(Command("status"))
+@dp.message(F.text == BTN_STATUS)
 async def cmd_status(message: Message):
     """Показать статус обеих памятей"""
     user_id = message.from_user.id
@@ -441,6 +644,7 @@ async def cmd_status(message: Message):
 
 
 @dp.message(Command("clear_chat"))
+@dp.message(F.text == BTN_CLEAR_CHAT)
 async def cmd_clear_chat(message: Message):
     """Очистить короткую память (историю диалога)"""
     user_id = message.from_user.id
@@ -457,6 +661,7 @@ async def cmd_clear_chat(message: Message):
 
 
 @dp.message(Command("clear_docs"))
+@dp.message(F.text == BTN_CLEAR_DOCS)
 async def cmd_clear_docs(message: Message):
     """Очистить долгую память (документы)"""
     user_id = message.from_user.id
@@ -478,6 +683,7 @@ async def cmd_clear_docs(message: Message):
 
 
 @dp.message(Command("clear_all"))
+@dp.message(F.text == BTN_CLEAR_ALL)
 async def cmd_clear_all(message: Message):
     """Очистить всё (и короткую, и долгую память)"""
     user_id = message.from_user.id
@@ -573,7 +779,9 @@ async def handle_text_message(message: Message):
     user_text = message.text
     
     logger.info(f"Сообщение от user_id={user_id}: {user_text[:100]}")
-    
+    database.add_user_request(user_id, user_text)
+    export_long_memory_to_json()
+
     # Показываем индикатор печати
     await message.bot.send_chat_action(
         chat_id=message.chat.id,
@@ -596,8 +804,10 @@ async def main():
     logger.info("🚀 Бот с гибридной памятью запущен!")
     logger.info(f"💭 Короткая память: {HISTORY_SIZE} сообщений")
     logger.info(f"📚 Долгая память: {collection.count()} фрагментов в базе")
+    export_long_memory_to_json()
     
     await bot.delete_webhook(drop_pending_updates=True)
+    await bot.set_my_commands(BOT_COMMANDS)
     await dp.start_polling(bot)
 
 

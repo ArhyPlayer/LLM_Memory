@@ -1,6 +1,7 @@
 aiogram
 openai
 python-dotenv
+pydantic
 
 # Для бота с долгой памятью (bot_long_memory.py)
 chromadb
